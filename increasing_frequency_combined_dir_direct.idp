@@ -3,12 +3,9 @@ load "PETSc-complex"
 load "lapack"
 include "macro_ddm.idp"
 load "bem"
-load "medit" 
-load "mmg3d-v4.0"
-include "MeshSurface.idp"
-
-// load "gmsh"
+load "gmsh"
 include "getARGV.idp"
+
 
 // Dimension
 IFMACRO(dimension,3S)
@@ -33,20 +30,8 @@ real    eps        = getARGV("-eps", 1e-6);
 int     save       = getARGV("-save", 0);
 
 
-// incident wave
-real angle = 0;
-func finc   = exp(1i*kappa*(cos(angle)*x + sin(angle)*y + 0*z));
-func dxfinc = 1i*kappa*cos(angle)*finc;
-func dyfinc = 1i*kappa*sin(angle)*finc;
-func dzfinc = 1i*kappa*0*finc;
-
 // Mesh
-// int n         = 1000;
-// border circle(t=0, 2*pi) { x=cos(t); y=sin(t); z=0; }
-// meshL ThS = buildmeshL(circle(n));
-real hs = 0.8; 
-meshS ThS = Sphere(1,hs,300,-1);
-// meshN ThS = gmshloadN(meshinput);
+meshN ThS = gmshloadN(meshinput);
 ThS = OrientNormal(ThS,unbounded=1);
 meshN ThG = ThS;
 
@@ -55,28 +40,46 @@ meshN ThG = ThS;
 fespace Uh(ThS, P1);
 
 // HMatrix
-// BemKernel SL("SL", k=kappa);
-// BemKernel TDL("TDL", k=kappa);
-// BemKernel Combined = 1i*kappa*SL+TDL;
-// varf vk(u, v) = intNxN(ThS)(ThS)(BEM(Combined, u, v))-intN(ThS)(0.5*u*v);
-varf vk(u, v) = int2dx2d(ThS)(ThS)(BEM(BemKernel("SL", k=kappa), u, v));
+BemKernel SL("SL", k=kappa);
+BemKernel TDL("TDL", k=kappa);
+BemKernel Combined = 1i*kappa*SL+TDL;
+varf vk(u, v) = intNxN(ThS)(ThS)(BEM(Combined, u, v))-intN(ThS)(0.5*u*v);
 HMatrix<complex> A = vk(Uh, Uh,eta=eta,eps=eps);
-// if (mpirank == 0) cout << A.infos << endl;
+if (mpirank == 0) cout << A.infos << endl;
 
+
+// incident wave
+real angle = 0;
+func finc   = exp(1i*kappa*(cos(angle)*x + sin(angle)*y + 0*z));
+func dxfinc = 1i*kappa*cos(angle)*finc;
+func dyfinc = 1i*kappa*sin(angle)*finc;
+func dzfinc = 1i*kappa*0*finc;
+
+// RHS
+IFMACRO(dimension,3S)
+    varf vRHS(u, v) = -intN(ThS)(1i*kappa*finc*v)-intN(ThS)((dxfinc*Ns.x+dyfinc*Ns.y+dzfinc*Ns.z)*v);
+ENDIFMACRO
+IFMACRO(dimension,3L)
+    varf vRHS(u, v) = -intN(ThS)(1i*kappa*finc*v)-intN(ThS)((dxfinc*Tl.y-dyfinc*Tl.x)*v);
+ENDIFMACRO
 
 // Mass matrix
 Mat<complex> H;
 createMat(ThS, H, P1);
-plotDmesh(ThS, cmm = "Partitioning");
+// plotDmesh(ThS, cmm = "Partitioning");
 if(mass) {
     varf vM(u, v) = intN(ThS)(u * v);
     matrix<complex> Loc = vM(Uh, Uh);
     H = Loc;
     set(H, sparams = "", prefix = "mass_");
+    // varf vM(u, v) = intN(ThS)(u * v);
+    // H = vM(Uh, Uh);
+    // set(H, sparams = "-mass_ksp_converged_reason", prefix = "mass_");
 }
 
 
-// // Permutation
+cout<<"permutation"<<endl;
+// Permutation
 int[int] perm;
 {
     fespace UhG(ThG, P1);
@@ -88,6 +91,7 @@ int[int] perm;
 
 // Global operator (with enclosed permutation)
 int NbIt=0;
+cout<<"op def"<<endl;
 func complex[int] op(complex[int]& in) {
     complex[int] out(in.n), u(ThG.nt), v(ThG.nt);
     for[i, p : perm] u[p] = in[i];
@@ -100,6 +104,7 @@ func complex[int] op(complex[int]& in) {
 
 
 // Precond
+cout<<"prec def"<<endl;
 func complex[int] prec(complex[int]& in) {
     complex[int] out(in.n);
     if (mass){
@@ -107,52 +112,57 @@ func complex[int] prec(complex[int]& in) {
         return out;
     }
     else {
+        // cout<<"prec"<<endl;
         return in;
     }
     
 }
 
-// RHS
-IFMACRO(dimension,3S)
-    // varf vRHS(u, v) = -intN(ThS)(1i*kappa*finc*v)-intN(ThS)((dxfinc*Ns.x+dyfinc*Ns.y+dzfinc*Ns.z)*v);
-    varf vRHS(u, v) = -int2d(ThS)(finc*v);
-ENDIFMACRO
-IFMACRO(dimension,3L)
-    // varf vRHS(u, v) = -intN(ThS)(1i*kappa*finc*v)-intN(ThS)((dxfinc*Tl.y-dyfinc*Tl.x)*v);
-    varf vRHS(u, v) = -int2d(ThS)(finc*v);
-ENDIFMACRO
 
-// complex[int,int] solutions(H.n,NbSources);
+// varf vRHS(u, v) = -int2d(ThS)(finc*v);
 
-// for (int l=0;l<NbSources;l++){
+// Uh<complex> bf;
+// bf[] = vRHS(0, Uh);
+// complex[int] b, u;
+// ChangeNumbering(H, bf[], b);
+// u.resize(b.n);
+// KSPSolve(op, b, u, precon = prec, sparams = "-ksp_type fgmres -ksp_view_singularvalues -ksp_converged_reason -ksp_gmres_restart 1000 -pc_type shell");
+
+// cout<<"solutions def"<<endl;
+complex[int,int] solutions(H.n,NbSources);
+
+// cout<<"loop start"<<endl;
+for (int l=0;l<NbSources;l++){
 
     // Directions of sources
     angle =pi/4;
-    // if (NbSources!=1){
-    //     angle =l*pi/(NbSources-1);
-    // }
+    if (NbSources!=1){
+        angle =l*pi/(NbSources-1);
+    }
     
     // Solve
     Uh<complex> bf;
     bf[] = vRHS(0, Uh);
     complex[int] b, u;
-    ChangeNumbering(H, bf[], b);
+    changeNumbering(H, bf[], b);
     u.resize(b.n);
 
     // real[int] residuals(1000);
     // KSPSetResidualHistory(A, residuals)
-    KSPSolve(op, b, u, precon = prec, sparams = "-ksp_converged_reason -pc_type shell");
-    // solutions(:,l)=u;
+    cout<<"start ksp"<<endl;
+    KSPSolve(op, b, u, precon = prec, sparams = "-ksp_type fgmres -ksp_view_singularvalues -ksp_converged_reason -ksp_gmres_restart 1000 -pc_type shell");
+    cout<<"start end"<<endl;
+    solutions(:,l)=u;
  
-    // // Output
-    // if(mpirank == 0) {
-    //     ofstream output(outputpath+signature+"_convergence.csv", append);
-    //     output << kappa <<","<< angle <<","<< NbIt << endl;
-    // }
-    // NbIt=0;
-// }
+    // Output
+    if(mpirank == 0) {
+        ofstream output(outputpath+signature+"_convergence.csv", append);
+        output << kappa <<","<< angle <<","<< NbIt << endl;
+    }
+    NbIt=0;
+}
 
-// // Vsisualization
+// Vsisualization
 // if(!NoGraphicWindow || save==1) {
 //     ThS = OrientNormal(ThG, unbounded = 1);
 
@@ -164,18 +174,18 @@ ENDIFMACRO
 //     HMatrix<complex> B = vp(Uh, UhOut);
 //     UhOut<complex> v, vinc;
 
-//     // for (int l=0;l<NbSources;l++){
+//     for (int l=0;l<NbSources;l++){
         
 //         // Directions of sources
 //         angle =pi/4;
-//         // if (NbSources!=1){
-//         //     angle =l*pi/(NbSources-1);
-//         // }
+//         if (NbSources!=1){
+//             angle =l*pi/(NbSources-1);
+//         }
 
 //         // 
 //         Uh<complex> uf,bf;
 //         bf = 0;
-//         for[i, p : perm] bf[][p] = u[i];
+//         for[i, p : perm] bf[][p] = solutions(i,l);
 //         mpiAllReduce(bf[], uf[], mpiCommWorld, mpiSUM);
 
 //         // 
@@ -187,10 +197,10 @@ ENDIFMACRO
 //             plot(vr, dim=2, fill=1, nbiso=20, cmm = "Solution");
 //         }
         
-//         // if(mpirank == 0 && save == 1) {
-//         //     int[int] fforder = [1, 1, 1];
-//         //     savevtk(outputpath+signature+l+"_convergence.vtu", ThOut, real(v), imag(v), abs(v), dataname = "u.re u.im u.abs", order = fforder, bin = 1);
-//         // }
+//         if(mpirank == 0 && save == 1) {
+//             int[int] fforder = [1, 1, 1];
+//             savevtk(outputpath+signature+l+"_convergence.vtu", ThOut, real(v), imag(v), abs(v), dataname = "u.re u.im u.abs", order = fforder, bin = 1);
+//         }
 
-//     // }
+//     }
 // }
