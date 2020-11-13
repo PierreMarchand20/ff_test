@@ -1,0 +1,196 @@
+load "iovtk"
+load "PETSc-complex"
+load "lapack"
+include "macro_ddm.idp"
+load "bem"
+load "medit" 
+load "mmg3d-v4.0"
+include "MeshSurface.idp"
+
+// load "gmsh"
+include "getARGV.idp"
+
+// Dimension
+IFMACRO(dimension,3S)
+load "msh3"
+macro gmshloadN()gmshloadS// EOM
+ENDIFMACRO
+IFMACRO(dimension,3L)
+load "msh3"
+macro gmshloadN()gmshloadL// EOM
+ENDIFMACRO
+
+// Input
+real    kappa      = getARGV("-kappa", 10.);
+int     NbSources  = getARGV("-NbSources", 1);
+string  meshinput  = getARGV("-meshinput","mesh.msh");
+string  meshoutput = getARGV("-meshoutput","mesh.msh");
+string  outputpath = getARGV("-outputpath", "");
+string  signature  = getARGV("-signature", "");
+bool    mass       = getARGV("-mass", 1);
+real    eta        = getARGV("-eta", 1);
+real    eps        = getARGV("-eps", 1e-6);
+int     save       = getARGV("-save", 0);
+
+
+// incident wave
+real angle = 0;
+func finc   = exp(1i*kappa*(cos(angle)*x + sin(angle)*y + 0*z));
+func dxfinc = 1i*kappa*cos(angle)*finc;
+func dyfinc = 1i*kappa*sin(angle)*finc;
+func dzfinc = 1i*kappa*0*finc;
+
+// Mesh
+// int n         = 1000;
+// border circle(t=0, 2*pi) { x=cos(t); y=sin(t); z=0; }
+// meshL ThS = buildmeshL(circle(n));
+real hs = 0.8; 
+meshS ThS = Sphere(1,hs,300,-1);
+// meshN ThS = gmshloadN(meshinput);
+ThS = OrientNormal(ThS,unbounded=1);
+meshN ThG = ThS;
+
+
+// Finite element space
+fespace Uh(ThS, P1);
+
+// HMatrix
+// BemKernel SL("SL", k=kappa);
+// BemKernel TDL("TDL", k=kappa);
+// BemKernel Combined = 1i*kappa*SL+TDL;
+// varf vk(u, v) = intNxN(ThS)(ThS)(BEM(Combined, u, v))-intN(ThS)(0.5*u*v);
+varf vk(u, v) = int2dx2d(ThS)(ThS)(BEM(BemKernel("SL", k=kappa), u, v));
+HMatrix<complex> A = vk(Uh, Uh,eta=eta,eps=eps);
+// if (mpirank == 0) cout << A.infos << endl;
+
+
+// Mass matrix
+Mat<complex> H;
+createMat(ThS, H, P1);
+plotDmesh(ThS, cmm = "Partitioning");
+if(mass) {
+    varf vM(u, v) = intN(ThS)(u * v);
+    matrix<complex> Loc = vM(Uh, Uh);
+    H = Loc;
+    set(H, sparams = "", prefix = "mass_");
+}
+
+
+// // Permutation
+int[int] perm;
+{
+    fespace UhG(ThG, P1);
+    UhG<complex> numbering;
+    numbering[] = 0:UhG.ndof - 1;
+    Uh<complex> glob2loc = numbering;
+    ChangeNumbering(H, glob2loc[], perm);
+}
+
+// Global operator (with enclosed permutation)
+int NbIt=0;
+func complex[int] op(complex[int]& in) {
+    complex[int] out(in.n), u(ThG.nt), v(ThG.nt);
+    for[i, p : perm] u[p] = in[i];
+    mpiAllReduce(u, v, mpiCommWorld, mpiSUM);
+    u = A * v;
+    for[i, p : perm] out[i] = u[p];
+    NbIt++;
+    return out;
+}
+
+
+// Precond
+func complex[int] prec(complex[int]& in) {
+    complex[int] out(in.n);
+    if (mass){
+        KSPSolve(H, in, out);
+        return out;
+    }
+    else {
+        return in;
+    }
+    
+}
+
+// RHS
+IFMACRO(dimension,3S)
+    // varf vRHS(u, v) = -intN(ThS)(1i*kappa*finc*v)-intN(ThS)((dxfinc*Ns.x+dyfinc*Ns.y+dzfinc*Ns.z)*v);
+    varf vRHS(u, v) = -int2d(ThS)(finc*v);
+ENDIFMACRO
+IFMACRO(dimension,3L)
+    // varf vRHS(u, v) = -intN(ThS)(1i*kappa*finc*v)-intN(ThS)((dxfinc*Tl.y-dyfinc*Tl.x)*v);
+    varf vRHS(u, v) = -int2d(ThS)(finc*v);
+ENDIFMACRO
+
+// complex[int,int] solutions(H.n,NbSources);
+
+// for (int l=0;l<NbSources;l++){
+
+    // Directions of sources
+    angle =pi/4;
+    // if (NbSources!=1){
+    //     angle =l*pi/(NbSources-1);
+    // }
+    
+    // Solve
+    Uh<complex> bf;
+    bf[] = vRHS(0, Uh);
+    complex[int] b, u;
+    ChangeNumbering(H, bf[], b);
+    u.resize(b.n);
+
+    // real[int] residuals(1000);
+    // KSPSetResidualHistory(A, residuals)
+    KSPSolve(op, b, u, precon = prec, sparams = "-ksp_converged_reason -pc_type shell");
+    // solutions(:,l)=u;
+ 
+    // // Output
+    // if(mpirank == 0) {
+    //     ofstream output(outputpath+signature+"_convergence.csv", append);
+    //     output << kappa <<","<< angle <<","<< NbIt << endl;
+    // }
+    // NbIt=0;
+// }
+
+// // Vsisualization
+// if(!NoGraphicWindow || save==1) {
+//     ThS = OrientNormal(ThG, unbounded = 1);
+
+
+//     mesh ThOut = gmshload(meshoutput);
+//     fespace UhOut(ThOut, P1);
+//     BemPotential Pot("SL", k=kappa);
+//     varf vp(u, v) = intN(ThS)(POT(Pot, u, v));
+//     HMatrix<complex> B = vp(Uh, UhOut);
+//     UhOut<complex> v, vinc;
+
+//     // for (int l=0;l<NbSources;l++){
+        
+//         // Directions of sources
+//         angle =pi/4;
+//         // if (NbSources!=1){
+//         //     angle =l*pi/(NbSources-1);
+//         // }
+
+//         // 
+//         Uh<complex> uf,bf;
+//         bf = 0;
+//         for[i, p : perm] bf[][p] = u[i];
+//         mpiAllReduce(bf[], uf[], mpiCommWorld, mpiSUM);
+
+//         // 
+//         vinc = finc;
+//         v[] = B*uf[];
+//         v[] += vinc[];
+//         UhOut vr = abs(v);
+//         if (!NoGraphicWindow){
+//             plot(vr, dim=2, fill=1, nbiso=20, cmm = "Solution");
+//         }
+        
+//         // if(mpirank == 0 && save == 1) {
+//         //     int[int] fforder = [1, 1, 1];
+//         //     savevtk(outputpath+signature+l+"_convergence.vtu", ThOut, real(v), imag(v), abs(v), dataname = "u.re u.im u.abs", order = fforder, bin = 1);
+//         // }
+
+//     // }
+// }
